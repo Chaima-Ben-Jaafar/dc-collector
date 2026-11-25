@@ -20,8 +20,10 @@ v2 (25 Nov 2026) changes, for unattended runs on GitHub Actions:
     calendar day (counted both in UTC and in US Eastern time, so the limit holds whichever
     "day" DonorsChoose means), or if its last observation is less than MIN_HOURS_BETWEEN_OBS
     old. Extra, manual or delayed runs are therefore safe;
-  * a run is allowed at any time inside the approved window (the guard enforces the limits),
-    so delayed scheduled runs are not lost;
+  * three observation slots per day (06-14, 14-22, 22-06 UTC). The workflow is triggered every
+    2 hours; the first run that starts in a slot observes each open project once and enrols new
+    projects once; later runs in the same slot do nothing. Delayed or dropped GitHub triggers
+    therefore cost at most a few hours, not a whole observation;
   * the four extra enrolment fields are stored in registry.csv (raw approval time in ms, so
     the time-zone conversion can be fixed at analysis time);
   * `final-check` mode;
@@ -73,12 +75,30 @@ OBS_FIELDS = ["run_utc", "fetched_utc", "project_id", "still_needed", "still_nee
 FINAL_FIELDS = ["checked_utc", "project_id", "final_status", "http_status", "source"]
 
 
+def slot_of(t: datetime) -> str:
+    """Observation slot: 06:00-13:59, 14:00-21:59, 22:00-05:59 UTC (one observation per project per slot)."""
+    a = t - timedelta(hours=6)
+    return f"{a.date().isoformat()}-{a.hour // 8}"
+
+
 def data_dir() -> Path:
     return Path(os.environ.get("DC_DATA_DIR") or Path(__file__).resolve().parent / "data")
 
 
 def registry_path() -> Path:
     return data_dir() / "registry.csv"
+
+
+def load_state() -> dict:
+    try:
+        return json.loads((data_dir() / "state.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    data_dir().mkdir(parents=True, exist_ok=True)
+    (data_dir() / "state.json").write_text(json.dumps(state, indent=1))
 
 
 _last_request = 0.0
@@ -286,12 +306,16 @@ def run(now: datetime | None = None, fetcher=fetch, rng: random.Random | None = 
     now = now or clock()
     rng = rng or random.Random(int(now.strftime("%Y%m%d%H")))
     reg = load_registry()
+    state = load_state()
+    slot = slot_of(now)
     stamp = now.replace(second=0, microsecond=0)
     n_requests = 0
 
-    # 1. discovery
+    # 1. discovery (once per slot)
     key = os.environ.get("DC_API_KEY", "")
-    if now < ENROL_UNTIL and len(reg) < SAMPLE_CAP:
+    if state.get("last_discovery_slot") == slot:
+        print("discovery: already done in this slot", flush=True)
+    elif now < ENROL_UNTIL and len(reg) < SAMPLE_CAP:
         if not key:
             print("DC_API_KEY not set; discovery skipped", flush=True)
         else:
@@ -315,11 +339,16 @@ def run(now: datetime | None = None, fetcher=fetch, rng: random.Random | None = 
                     "status": "open", "n_obs": "0", **extra}
             print(f"discovery: {len(fresh)} unseen projects on {LISTING_PAGES} pages, enrolled {take}; "
                   f"sample size now {len(reg)}", flush=True)
+            state["last_discovery_slot"] = slot
 
     # 2. observation (each open project at most once per run, and only if the guard allows it)
-    rows, skipped = [], 0
+    rows, skipped, done = [], 0, 0
     for pid, r in reg.items():
         if r["status"] != "open":
+            continue
+        ts = _times(r)
+        if ts and slot_of(ts[-1]) == slot:
+            done += 1
             continue
         if not can_observe(r, clock()):
             skipped += 1
@@ -343,6 +372,9 @@ def run(now: datetime | None = None, fetcher=fetch, rng: random.Random | None = 
         elif ok and r["expiration_date"] and r["expiration_date"] < fetched.date().isoformat():
             r["status"] = "expired"
     save_registry(reg)
+    save_state(state)
+    if done:
+        print(f"{done} projects already observed in this slot", flush=True)
     if skipped:
         print(f"guard: skipped {skipped} projects (observation limit)", flush=True)
     if not rows:
