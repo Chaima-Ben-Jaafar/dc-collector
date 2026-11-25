@@ -3,12 +3,21 @@ name: DonorsChoose historical sample
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "probe (find how deep the list loads) or collect"
+        type: choice
+        options: [probe, collect]
+        default: probe
       target:
         description: "number of projects to reach (test: 50; full: 20000)"
         default: "50"
       max_requests:
         description: "maximum requests in this run (test: 5; leave empty for no limit)"
         default: "5"
+        required: false
+      max_page:
+        description: "collect only from pages 0..max_page (empty = all pages)"
+        default: ""
         required: false
 
 permissions:
@@ -35,13 +44,16 @@ jobs:
 
       - name: Collect
         env:
+          MODE: ${{ inputs.mode }}
           TARGET: ${{ inputs.target }}
           MAXREQ: ${{ inputs.max_requests }}
+          MAXPAGE: ${{ inputs.max_page }}
           DC_API_KEY: ${{ secrets.DC_API_KEY }}
           DC_CONTACT: ${{ secrets.DC_CONTACT }}
           DC_HIST_DIR: ${{ github.workspace }}/dc-data/historical
         run: |
-          python3 dc_historical.py collect "$TARGET" "$MAXREQ"
+          if [ "$MODE" = "probe" ]; then python3 dc_historical.py probe 12; exit 0; fi
+          python3 dc_historical.py collect "$TARGET" "$MAXREQ" "$MAXPAGE"
           python3 dc_historical.py summary
 
       - name: Save data to the private repository
