@@ -1,0 +1,54 @@
+name: DonorsChoose collector
+
+on:
+  schedule:
+    - cron: "17 6,14,22 * * *"      # about 06:17, 14:17, 22:17 UTC (GitHub may start a little late)
+  workflow_dispatch:                 # "Run workflow" button for a missed run
+    inputs:
+      mode:
+        description: "run (normal) or final-check (after expiry dates, Jan-Mar 2027)"
+        type: choice
+        options: [run, final-check]
+        default: run
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dc-collector                # never two runs at the same time
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - name: Get collector code
+        uses: actions/checkout@v4
+
+      - name: Get private data repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/dc-data
+          token: ${{ secrets.DATA_REPO_TOKEN }}
+          path: dc-data
+
+      - name: Collect
+        env:
+          MODE: ${{ inputs.mode || 'run' }}
+          DC_API_KEY: ${{ secrets.DC_API_KEY }}
+          DC_CONTACT: ${{ secrets.DC_CONTACT }}
+          DC_DATA_DIR: ${{ github.workspace }}/dc-data/data
+        run: python3 dc_collector.py "$MODE"
+
+      - name: Save data to the private repository
+        if: always()
+        working-directory: dc-data
+        run: |
+          git config user.name "dc-collector"
+          git config user.email "dc-collector@users.noreply.github.com"
+          git add -A data 2>/dev/null || true
+          if git diff --cached --quiet; then echo "no new data"; exit 0; fi
+          git commit -q -m "collector run $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -q
+          echo "data saved"
