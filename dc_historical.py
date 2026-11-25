@@ -14,6 +14,8 @@ sample is described as "approximately random"; `page_index` is stored to check c
 Usage (environment: DC_API_KEY, optional DC_HIST_DIR, DC_CONTACT):
     python dc_historical.py collect 50 5        # test: up to 50 projects, at most 5 requests
     python dc_historical.py collect 20000       # full run (resumable: run again to continue)
+    python dc_historical.py collect 20000 "" 999   # sample only pages 0-999 (if deeper pages do not load)
+    python dc_historical.py probe 12            # find the deepest page that loads (12 requests)
     python dc_historical.py summary
 """
 from __future__ import annotations
@@ -110,7 +112,7 @@ class Historical:
         return status, total, data.get("proposals", []) or []
 
     # ---------------------------------------------------------------- collection
-    def collect(self, target: int, max_requests: int | None = None) -> dict:
+    def collect(self, target: int, max_requests: int | None = None, max_page: int | None = None) -> dict:
         key = os.environ.get("DC_API_KEY", "")
         if not key:
             print("DC_API_KEY not set; nothing done", flush=True)
@@ -120,6 +122,8 @@ class Historical:
             return {}
         st, seen = self._load(), self._seen()
         n_req = 0
+        if "pages" in st and st.get("max_page") != max_page:     # sampling frame changed: re-plan, keep data
+            st = {}
         if "pages" not in st:                          # plan a random page order once (seeded, recorded)
             status, total, props = self._page(0, key)
             n_req += 1
@@ -127,9 +131,12 @@ class Historical:
                 print(f"first request returned status {status}; nothing planned", flush=True)
                 return {}
             n_pages = (total + 9) // 10
+            if max_page is not None:
+                n_pages = min(n_pages, max_page + 1)
             order = list(range(n_pages))
             random.Random(SEED).shuffle(order)
-            st = {"seed": SEED, "total_proposals": total, "n_pages": n_pages, "pages": order, "pos": 0,
+            st = {"seed": SEED, "total_proposals": total, "n_pages": n_pages, "max_page": max_page,
+                  "pages": order, "pos": 0,
                   "planned_utc": self.clock().replace(microsecond=0).isoformat(),
                   "requests": 0, "empty_pages": 0, "failed_pages": 0, "duplicates": 0}
             self._save(st)
@@ -150,6 +157,7 @@ class Historical:
                 if status != 200:
                     st["failed_pages"] += 1
                     stats["failed"] += 1
+                    stats[f"status_{status}"] += 1
                     if stats["failed"] >= 5 and stats["failed"] > stats["ok"]:
                         print(f"stopping: repeated failures (last status {status})", flush=True)
                         break
@@ -177,7 +185,57 @@ class Historical:
         print(f"historical: {len(new_rows)} new projects, {len(seen)} in total, {n_req} requests this run; "
               f"pages used {st['pos']} of {st['n_pages']}; empty pages {st['empty_pages']}, "
               f"failed {st['failed_pages']}, duplicates {st['duplicates']}", flush=True)
+        codes = {k: v for k, v in stats.items() if k.startswith("status_")}
+        if codes:
+            print(f"failed requests by HTTP status: {codes}", flush=True)
         return {"new": len(new_rows), "total": len(seen), "requests": n_req}
+
+    # ---------------------------------------------------------------- depth probe
+    def probe(self, max_requests: int = 12) -> dict:
+        """Find the deepest page that loads (exponential steps, then bisection) and the approval
+        year found there. Prints status codes and years only."""
+        key = os.environ.get("DC_API_KEY", "")
+        if not key or self.clock() > HIST_UNTIL:
+            print("DC_API_KEY not set or outside the approved period; nothing done", flush=True)
+            return {}
+        n, ok, bad, codes, years = 0, -1, None, Counter(), {}
+
+        def look(page):
+            nonlocal n
+            status, total, props = self._page(page, key)
+            n += 1
+            codes[status] += 1
+            good = status == 200 and len(props) > 0
+            if good:
+                ys = []
+                for p in props:
+                    try:
+                        ys.append(datetime.fromtimestamp(float(p.get("approvedTime")) / 1000, timezone.utc).year)
+                    except (TypeError, ValueError, OSError):
+                        pass
+                years[page] = f"{min(ys)}-{max(ys)}" if ys else "?"
+            print(f"  page {page}: status {status}, {len(props)} projects, years {years.get(page, '-')}", flush=True)
+            return good
+
+        page = 1
+        while n < max_requests:                        # 1, 10, 100, ... until a page fails
+            if look(page):
+                ok = page
+                page *= 10
+                if page > 400000:
+                    break
+            else:
+                bad = page
+                break
+        while bad is not None and n < max_requests and bad - ok > 1:   # bisection
+            mid = (ok + bad) // 2
+            if look(mid):
+                ok = mid
+            else:
+                bad = mid
+        print(f"probe: deepest page that loads {ok} (= about {10 * (ok + 1)} projects); first failing page {bad}; "
+              f"statuses {dict(codes)}; years at loaded pages {years}", flush=True)
+        return {"deepest_ok": ok, "first_bad": bad, "codes": dict(codes), "years": years, "requests": n}
 
     # ---------------------------------------------------------------- checks
     def summary(self) -> dict:
@@ -209,7 +267,12 @@ class Historical:
 def main(argv: list[str]) -> int:
     try:
         if len(argv) >= 3 and argv[1] == "collect":
-            Historical().collect(int(argv[2]), int(argv[3]) if len(argv) >= 4 and argv[3] else None)
+            maxreq = int(argv[3]) if len(argv) >= 4 and argv[3] else None
+            maxpage = int(argv[4]) if len(argv) >= 5 and argv[4] else None
+            Historical().collect(int(argv[2]), maxreq, maxpage)
+            return 0
+        if len(argv) >= 2 and argv[1] == "probe":
+            Historical().probe(int(argv[2]) if len(argv) >= 3 and argv[2] else 12)
             return 0
         if len(argv) >= 2 and argv[1] == "summary":
             Historical().summary()
