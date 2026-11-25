@@ -50,5 +50,5 @@ jobs:
           git add -A data 2>/dev/null || true
           if git diff --cached --quiet; then echo "no new data"; exit 0; fi
           git commit -q -m "collector run $(date -u +%Y-%m-%dT%H:%MZ)"
-          git push -q
-          echo "data saved"
+          for i in 1 2 3; do git pull -q --rebase && git push -q && echo "data saved" && exit 0; sleep 10; done
+          exit 1
