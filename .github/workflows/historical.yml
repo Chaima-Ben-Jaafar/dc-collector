@@ -1,0 +1,57 @@
+name: DonorsChoose historical sample
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "number of projects to reach (test: 50; full: 20000)"
+        default: "50"
+      max_requests:
+        description: "maximum requests in this run (test: 5; leave empty for no limit)"
+        default: "5"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dc-historical
+  cancel-in-progress: false
+
+jobs:
+  historical:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Get collector code
+        uses: actions/checkout@v4
+
+      - name: Get private data repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/dc-data
+          token: ${{ secrets.DATA_REPO_TOKEN }}
+          path: dc-data
+
+      - name: Collect
+        env:
+          TARGET: ${{ inputs.target }}
+          MAXREQ: ${{ inputs.max_requests }}
+          DC_API_KEY: ${{ secrets.DC_API_KEY }}
+          DC_CONTACT: ${{ secrets.DC_CONTACT }}
+          DC_HIST_DIR: ${{ github.workspace }}/dc-data/historical
+        run: |
+          python3 dc_historical.py collect "$TARGET" "$MAXREQ"
+          python3 dc_historical.py summary
+
+      - name: Save data to the private repository
+        if: always()
+        working-directory: dc-data
+        run: |
+          git config user.name "dc-collector"
+          git config user.email "dc-collector@users.noreply.github.com"
+          git add -A historical 2>/dev/null || true
+          if git diff --cached --quiet; then echo "no new data"; exit 0; fi
+          git commit -q -m "historical run $(date -u +%Y-%m-%dT%H:%MZ)"
+          for i in 1 2 3; do git pull -q --rebase && git push -q && echo "data saved" && exit 0; sleep 10; done
+          exit 1
